@@ -5,14 +5,14 @@
 """Test the interfaces charm library."""
 
 import pytest
-from charms.filesystem_client.v0.interfaces import (
-    FsRequires,
+from charms.filesystem_client.v0.filesystem_info import (
+    FilesystemRequires,
     _hostinfo,
 )
 from ops import CharmBase
 
-FS_INTEGRATION_NAME = "fs-share"
-FS_INTEGRATION_INTERFACE = "fs_share"
+FS_INTEGRATION_NAME = "filesystem"
+FS_INTEGRATION_INTERFACE = "filesystem_info"
 FS_CLIENT_METADATA = f"""
 name: fs-client
 requires:
@@ -33,7 +33,7 @@ class FsClientCharm(CharmBase):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.requirer = FsRequires(self, FS_INTEGRATION_NAME)
+        self.requirer = FilesystemRequires(self, FS_INTEGRATION_NAME)
         self.framework.observe(self.requirer.on.mount_fs, lambda *_: None)
         self.framework.observe(self.requirer.on.umount_fs, lambda *_: None)
 

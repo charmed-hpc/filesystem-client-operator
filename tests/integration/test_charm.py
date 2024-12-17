@@ -9,7 +9,7 @@ from pathlib import Path
 import juju
 import pytest
 import yaml
-from charms.filesystem_client.v0.interfaces import CephfsInfo, NfsInfo
+from charms.filesystem_client.v0.filesystem_info import CephfsInfo, NfsInfo
 from pytest_operator.plugin import OpsTest
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ async def test_build_and_deploy(ops_test: OpsTest):
             application_name=APP_NAME,
             num_units=0,
             config={
-                "mountinfo": """
+                "mounts": """
             {
                 "nfs": {
                     "mountpoint": "/nfs",
@@ -79,6 +79,7 @@ async def test_build_and_deploy(ops_test: OpsTest):
             config={
                 "type": "nfs",
             },
+            constraints=juju.constraints.parse("virt-type=virtual-machine"),
         ),
         ops_test.model.deploy(
             server,
@@ -86,6 +87,7 @@ async def test_build_and_deploy(ops_test: OpsTest):
             config={
                 "type": "cephfs",
             },
+            constraints=juju.constraints.parse("virt-type=virtual-machine root-disk=50G mem=8G"),
         ),
         ops_test.model.wait_for_idle(
             apps=["nfs-server", "cephfs-server", "ubuntu"],
@@ -100,59 +102,27 @@ async def test_build_and_deploy(ops_test: OpsTest):
 @pytest.mark.order(2)
 async def test_integrate(ops_test: OpsTest):
     await ops_test.model.integrate(f"{APP_NAME}:juju-info", "ubuntu:juju-info")
-    await ops_test.model.integrate(f"{APP_NAME}:fs-share", "nfs-server:fs-share")
-    await ops_test.model.integrate(f"{APP_NAME}:fs-share", "cephfs-server:fs-share")
+    await ops_test.model.integrate(f"{APP_NAME}:filesystem", "nfs-server:filesystem")
+    await ops_test.model.integrate(f"{APP_NAME}:filesystem", "cephfs-server:filesystem")
 
     await ops_test.model.wait_for_idle(
         apps=[APP_NAME, "ubuntu", "nfs-server", "cephfs-server"], status="active", timeout=1000
     )
 
 
-async def check_autofs(
-    ops_test: OpsTest,
-    master_file: str,
-    autofs_file: str,
-    mountpoint: str,
-    opts: [str],
-    endpoint: str,
-):
-    unit = ops_test.model.applications["ubuntu"].units[0]
-    master = (await unit.ssh(f"cat {master_file}")).split()
-    mount = (await unit.ssh(f"cat {autofs_file}")).split()
-
-    assert autofs_file == master[1]
-    assert mountpoint == mount[0]
-    assert set(opts) == set(mount[1].removeprefix("-").split(","))
-    assert endpoint == mount[2]
-
-
 @pytest.mark.order(3)
 async def test_nfs_files(ops_test: OpsTest):
-    await check_autofs(
-        ops_test=ops_test,
-        master_file="/etc/auto.master.d/nfs.autofs",
-        autofs_file="/etc/auto.nfs",
-        mountpoint="/nfs",
-        opts=["exec", "suid", "nodev", "ro", f"port={NFS_INFO.port}"],
-        endpoint=f"{NFS_INFO.hostname}:{NFS_INFO.path}",
-    )
+    unit = ops_test.model.applications["ubuntu"].units[0]
+    result = (await unit.ssh("ls /nfs")).strip("\n")
+    assert "test-0" in result
+    assert "test-1" in result
+    assert "test-2" in result
 
 
 @pytest.mark.order(4)
 async def test_cephfs_files(ops_test: OpsTest):
-    await check_autofs(
-        ops_test=ops_test,
-        master_file="/etc/auto.master.d/cephfs.autofs",
-        autofs_file="/etc/auto.cephfs",
-        mountpoint="/cephfs",
-        opts=[
-            "noexec",
-            "nosuid",
-            "dev",
-            "rw",
-            "fstype=ceph",
-            f"mon_addr={"/".join(CEPHFS_INFO.monitor_hosts)}",
-            f"secret={CEPHFS_INFO.key}",
-        ],
-        endpoint=f"{CEPHFS_INFO.user}@{CEPHFS_INFO.fsid}.{CEPHFS_INFO.name}={CEPHFS_INFO.path}",
-    )
+    unit = ops_test.model.applications["ubuntu"].units[0]
+    result = (await unit.ssh("ls /cephfs")).strip("\n")
+    assert "test-0" in result
+    assert "test-1" in result
+    assert "test-2" in result

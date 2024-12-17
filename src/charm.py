@@ -7,12 +7,9 @@
 import json
 import logging
 from collections import Counter
-from contextlib import contextmanager
-from typing import Any, Generator, Optional
 
-import charms.operator_libs_linux.v0.apt as apt
 import ops
-from charms.filesystem_client.v0.interfaces import FsRequires
+from charms.filesystem_client.v0.filesystem_info import FilesystemRequires
 from jsonschema import ValidationError, validate
 
 from utils.manager import MountsManager
@@ -35,11 +32,12 @@ CONFIG_SCHEMA = {
     },
 }
 
-PEER_NAME = "storage-peers"
-
 
 class StopCharmError(Exception):
     """Exception raised when a method needs to finish the execution of the charm code."""
+
+    def __init__(self, status: ops.StatusBase):
+        self.status = status
 
 
 # Trying to use a delta charm (one method per event) proved to be a bit unwieldy, since
@@ -60,13 +58,13 @@ class FilesystemClientCharm(ops.CharmBase):
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
 
-        self._fs_share = FsRequires(self, "fs-share")
-        self._mounts_manager = MountsManager()
+        self._filesystems = FilesystemRequires(self, "filesystem")
+        self._mounts_manager = MountsManager(self)
         framework.observe(self.on.upgrade_charm, self._handle_event)
         framework.observe(self.on.update_status, self._handle_event)
         framework.observe(self.on.config_changed, self._handle_event)
-        framework.observe(self._fs_share.on.mount_fs, self._handle_event)
-        framework.observe(self._fs_share.on.umount_fs, self._handle_event)
+        framework.observe(self._filesystems.on.mount_filesystem, self._handle_event)
+        framework.observe(self._filesystems.on.umount_filesystem, self._handle_event)
 
     def _handle_event(self, event: ops.EventBase) -> None:  # noqa: C901
         try:
@@ -75,23 +73,24 @@ class FilesystemClientCharm(ops.CharmBase):
             self._ensure_installed()
             config = self._get_config()
             self._mount_filesystems(config)
-        except StopCharmError:
+        except StopCharmError as e:
             # This was the cleanest way to ensure the inner methods can still return prematurely
             # when an error occurs.
+            self.app.status = e.status
             return
 
-        self.unit.status = ops.ActiveStatus("Mounted shares.")
+        self.unit.status = ops.ActiveStatus("Mounted filesystems.")
 
     def _ensure_installed(self):
         """Ensure the required packages are installed into the unit."""
         if not self._mounts_manager.installed:
             self.unit.status = ops.MaintenanceStatus("Installing required packages.")
-            self._mounts_manager.ensure(apt.PackageState.Present)
+            self._mounts_manager.install()
 
     def _get_config(self) -> dict[str, dict[str, str | bool]]:
         """Get and validate the configuration of the charm."""
         try:
-            config = json.loads(str(self.config.get("mountinfo", "")))
+            config = json.loads(str(self.config.get("mounts", "")))
             validate(config, CONFIG_SCHEMA)
             config: dict[str, dict[str, str | bool]] = config
             for fs, opts in config.items():
@@ -99,39 +98,30 @@ class FilesystemClientCharm(ops.CharmBase):
                     opts[opt] = opts.get(opt, False)
             return config
         except (json.JSONDecodeError, ValidationError) as e:
-            self.app.status = ops.BlockedStatus(
-                f"invalid configuration for option `mountinfo`. reason: {e}"
+            raise StopCharmError(
+                ops.BlockedStatus(f"invalid configuration for option `mounts`. reason:\n{e}")
             )
-            raise StopCharmError()
 
     def _mount_filesystems(self, config: dict[str, dict[str, str | bool]]):
         """Mount all available filesystems for the charm."""
-        shares = self._fs_share.endpoints
-        active_filesystems = set()
-        for fs_type, count in Counter([share.fs_info.fs_type() for share in shares]).items():
+        endpoints = self._filesystems.endpoints
+        for fs_type, count in Counter(
+            [endpoint.info.filesystem_type() for endpoint in endpoints]
+        ).items():
             if count > 1:
-                self.app.status = ops.BlockedStatus(
-                    f"Too many relations for mount type `{fs_type}`."
+                raise StopCharmError(
+                    ops.BlockedStatus(f"Too many relations for mount type `{fs_type}`.")
                 )
-                raise StopCharmError()
-            active_filesystems.add(fs_type)
 
-        with self.mounts() as mounts:
-            # Cleanup and unmount all the mounts that are not available.
-            for fs_type in list(mounts.keys()):
-                if fs_type not in active_filesystems:
-                    self._mounts_manager.umount(str(mounts[fs_type]["mountpoint"]))
-                    del mounts[fs_type]
+        self.unit.status = ops.MaintenanceStatus("Ensuring filesystems are mounted.")
 
-            for share in shares:
-                fs_type = share.fs_info.fs_type()
+        with self._mounts_manager.mounts() as mounts:
+            for endpoint in endpoints:
+                fs_type = endpoint.info.filesystem_type()
                 if not (options := config.get(fs_type)):
-                    self.app.status = ops.BlockedStatus(
-                        f"Missing configuration for mount type `{fs_type}."
+                    raise StopCharmError(
+                        ops.BlockedStatus(f"Missing configuration for mount type `{fs_type}`.")
                     )
-                    raise StopCharmError()
-
-                options["uri"] = share.uri
 
                 mountpoint = str(options["mountpoint"])
 
@@ -140,45 +130,7 @@ class FilesystemClientCharm(ops.CharmBase):
                 opts.append("nosuid" if options.get("nosuid") else "suid")
                 opts.append("nodev" if options.get("nodev") else "dev")
                 opts.append("ro" if options.get("read-only") else "rw")
-
-                self.unit.status = ops.MaintenanceStatus(f"Mounting `{mountpoint}`")
-
-                if not (mount := mounts.get(fs_type)) or mount != options:
-                    # Just in case, unmount the previously mounted share
-                    if mount:
-                        self._mounts_manager.umount(str(mount["mountpoint"]))
-                    self._mounts_manager.mount(share.fs_info, mountpoint, options=opts)
-                    mounts[fs_type] = options
-
-    @property
-    def peers(self) -> Optional[ops.Relation]:
-        """Fetch the peer relation."""
-        return self.model.get_relation(PEER_NAME)
-
-    @contextmanager
-    def mounts(self) -> Generator[dict[str, dict[str, str | bool]], None, None]:
-        """Get the mounted filesystems."""
-        mounts = self.get_state("mounts")
-        yield mounts
-        # Don't set the state if the program throws an error.
-        # This guarantees we're in a clean state after the charm unblocks.
-        self.set_state("mounts", mounts)
-
-    def set_state(self, key: str, data: Any) -> None:
-        """Insert a value into the global state."""
-        if not self.peers:
-            raise RuntimeError(
-                "Peer relation can only be written to after the relation is established"
-            )
-        self.peers.data[self.app][key] = json.dumps(data)
-
-    def get_state(self, key: str) -> dict[Any, Any]:
-        """Get a value from the global state."""
-        if not self.peers:
-            return {}
-
-        data = self.peers.data[self.app].get(key, "{}")
-        return json.loads(data)
+                mounts.add(info=endpoint.info, mountpoint=mountpoint, options=opts)
 
 
 if __name__ == "__main__":  # pragma: nocover

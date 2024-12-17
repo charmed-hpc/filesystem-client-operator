@@ -3,18 +3,19 @@
 
 """Manage machine mounts and dependencies."""
 
+import contextlib
 import logging
 import os
 import pathlib
-import shutil
 import subprocess
 from dataclasses import dataclass
 from ipaddress import AddressValueError, IPv6Address
-from typing import Iterator, List, Optional, Union
+from typing import Generator, List, Optional, Union
 
 import charms.operator_libs_linux.v0.apt as apt
 import charms.operator_libs_linux.v1.systemd as systemd
-from charms.filesystem_client.v0.interfaces import CephfsInfo, FsInfo, NfsInfo
+import ops
+from charms.filesystem_client.v0.filesystem_info import CephfsInfo, FilesystemInfo, NfsInfo
 
 _logger = logging.getLogger(__name__)
 
@@ -53,15 +54,57 @@ class MountInfo:
     passno: str
 
 
+@dataclass
+class _MountInfo:
+    endpoint: str
+    options: [str]
+
+
+class Mounts:
+    """Collection of mounts that need to be managed by the `MountsManager`."""
+
+    _mounts: dict[str, _MountInfo]
+
+    def __init__(self):
+        self._mounts = {}
+
+    def add(
+        self,
+        info: FilesystemInfo,
+        mountpoint: Union[str, os.PathLike],
+        options: Optional[List[str]] = None,
+    ) -> None:
+        """Add a mount to the list of managed mounts.
+
+        Args:
+            info: Share information required to mount the share.
+            mountpoint: System location to mount the share.
+            options: Mount options to pass when mounting the share.
+
+        Raises:
+            Error: Raised if the mount operation fails.
+        """
+        if options is None:
+            options = []
+
+        endpoint, additional_opts = _get_endpoint_and_opts(info)
+        options = sorted(options + additional_opts)
+
+        self._mounts[str(mountpoint)] = _MountInfo(endpoint=endpoint, options=options)
+
+
 class MountsManager:
     """Manager for mounted filesystems in the current system."""
 
-    def __init__(self):
+    def __init__(self, charm: ops.CharmBase):
         # Lazily initialized
         self._pkgs = None
+        self._master_file = pathlib.Path(f"/etc/auto.master.d/{charm.app.name}.autofs")
+        self._autofs_file = pathlib.Path(f"/etc/auto.{charm.app.name}")
 
     @property
     def _packages(self) -> List[apt.DebianPackage]:
+        """List of packages required by the client."""
         if not self._pkgs:
             self._pkgs = [
                 apt.DebianPackage.from_system(pkg)
@@ -75,22 +118,34 @@ class MountsManager:
         for pkg in self._packages:
             if not pkg.present:
                 return False
+
+        if not self._master_file.exists or not self._autofs_file.exists:
+            return False
+
         return True
 
-    def ensure(self, state: apt.PackageState) -> None:
-        """Ensure that the mount packages are in the specified state.
+    def install(self):
+        """Install the required mount packages.
 
         Raises:
             Error: Raised if this failed to change the state of any of the required packages.
         """
         try:
             for pkg in self._packages:
-                pkg.ensure(state)
+                pkg.ensure(apt.PackageState.Present)
         except (apt.PackageError, apt.PackageNotFoundError) as e:
             _logger.error(
-                f"failed to change the state of the required packages. Reason:\n{e.message}"
+                f"failed to change the state of the required packages. reason:\n{e.message}"
             )
             raise Error(e.message)
+
+        try:
+            self._master_file.touch(mode=0o600)
+            self._autofs_file.touch(mode=0o600)
+            self._master_file.write_text(f"/- {self._autofs_file}")
+        except IOError as e:
+            _logger.error(f"failed to create the required autofs files. reason:\n{e}")
+            raise Error("failed to create the required autofs files")
 
     def supported(self) -> bool:
         """Check if underlying base supports mounting shares."""
@@ -107,156 +162,46 @@ class MountsManager:
             _logger.warning("Could not detect execution in virtualized environment")
             return True
 
-    def fetch(self, target: str) -> Optional[MountInfo]:
-        """Fetch information about a mount.
+    @contextlib.contextmanager
+    def mounts(self, force_mount=False) -> Generator[Mounts, None, None]:
+        """Get the list of `Mounts` that need to be managed by the `MountsManager`.
 
-        Args:
-            target: share mountpoint information to fetch.
-
-        Returns:
-            Optional[MountInfo]: Mount information. None if share is not mounted.
+        It will initially contain no mounts, and any mount that is added to
+        `Mounts` will be mounted by the manager. Mounts that were
+        added on previous executions will get removed if they're not added again
+        to the `Mounts` object.
         """
-        # We need to trigger an automount for the mounts that are of type `autofs`,
-        # since those could contain an unlisted mount.
-        _trigger_autofs()
-
-        for mount in _mounts():
-            if mount.mountpoint == target:
-                return mount
-
-        return None
-
-    def mounts(self) -> List[MountInfo]:
-        """Get all mounts on a machine.
-
-        Returns:
-            List[MountInfo]: All current mounts on machine.
-        """
-        _trigger_autofs()
-
-        return list(_mounts("autofs"))
-
-    def mounted(self, target: str) -> bool:
-        """Determine if mountpoint is mounted.
-
-        Args:
-            target: share mountpoint to check.
-        """
-        return self.fetch(target) is not None
-
-    def mount(
-        self,
-        share_info: FsInfo,
-        mountpoint: Union[str, os.PathLike],
-        options: Optional[List[str]] = None,
-    ) -> None:
-        """Mount a share.
-
-        Args:
-            share_info: Share information required to mount the share.
-            mountpoint: System location to mount the share.
-            options: Mount options to pass when mounting the share.
-
-        Raises:
-            Error: Raised if the mount operation fails.
-        """
-        if options is None:
-            options = []
-        # Try to create the mountpoint without checking if it exists to avoid TOCTOU.
-        target = pathlib.Path(mountpoint)
-        try:
-            target.mkdir()
-            _logger.debug(f"Created mountpoint {mountpoint}.")
-        except FileExistsError:
-            _logger.warning(f"Mountpoint {mountpoint} already exists.")
-
-        endpoint, additional_opts = _get_endpoint_and_opts(share_info)
-        options = options + additional_opts
-
-        _logger.debug(f"Mounting share {endpoint} at {target}")
-        autofs_id = _mountpoint_to_autofs_id(target)
-        pathlib.Path(f"/etc/auto.master.d/{autofs_id}.autofs").write_text(
-            f"/- /etc/auto.{autofs_id}"
-        )
-        pathlib.Path(f"/etc/auto.{autofs_id}").write_text(
-            f"{target} -{','.join(options)} {endpoint}"
+        mounts = Mounts()
+        yield mounts
+        # This will not resume if the caller raised an exception, which
+        # should be enough to ensure the file is not written if the charm entered
+        # an error state.
+        new_autofs = "\n".join(
+            (
+                f"{mountpoint} -{','.join(info.options)} {info.endpoint}"
+                for mountpoint, info in sorted(mounts._mounts.items())
+            )
         )
 
+        old_autofs = self._autofs_file.read_text()
+
+        # Avoid restarting autofs if the config didn't change.
+        if not force_mount and new_autofs == old_autofs:
+            return
+
         try:
+            for mount in mounts._mounts.keys():
+                pathlib.Path(mount).mkdir(parents=True, exist_ok=True)
+            self._autofs_file.write_text(new_autofs)
             systemd.service_reload("autofs", restart_on_failure=True)
         except systemd.SystemdError as e:
-            _logger.error(f"Failed to mount {endpoint} at {target}. Reason:\n{e}")
+            _logger.error(f"failed to mount filesystems. reason:\n{e}")
             if "Operation not permitted" in str(e) and not self.supported():
-                raise Error("Mounting shares not supported on LXD containers")
-            raise Error(f"Failed to mount {endpoint} at {target}")
-
-    def umount(self, mountpoint: Union[str, os.PathLike]) -> None:
-        """Unmount a share.
-
-        Args:
-            mountpoint: share mountpoint to unmount.
-
-        Raises:
-            Error: Raised if the unmount operation fails.
-        """
-        _logger.debug(f"Unmounting share at mountpoint {mountpoint}")
-        autofs_id = _mountpoint_to_autofs_id(mountpoint)
-        pathlib.Path(f"/etc/auto.{autofs_id}").unlink(missing_ok=True)
-        pathlib.Path(f"/etc/auto.master.d/{autofs_id}.autofs").unlink(missing_ok=True)
-
-        try:
-            systemd.service_reload("autofs", restart_on_failure=True)
-        except systemd.SystemdError as e:
-            _logger.error(f"Failed to unmount {mountpoint}. Reason:\n{e}")
-            raise Error(f"Failed to unmount {mountpoint}")
-
-        shutil.rmtree(mountpoint, ignore_errors=True)
+                raise Error("mounting shares not supported on LXD containers")
+            raise Error("failed to mount filesystems")
 
 
-def _trigger_autofs() -> None:
-    """Triggers a mount on all filesystems handled by autofs.
-
-    This function is useful to make autofs-managed mounts appear on the
-    `/proc/mount` file, since they could be unmounted when reading the file.
-    """
-    for fs in _mounts("autofs"):
-        _logger.info(f"triggering automount for `{fs.mountpoint}`")
-        try:
-            os.scandir(fs.mountpoint).close()
-        except OSError as e:
-            # Not critical since it could also be caused by unrelated mounts,
-            # but should be good to log it in case this causes problems.
-            _logger.warning(f"Could not trigger automount for `{fs.mountpoint}`. Reason:\n{e}")
-
-
-def _mountpoint_to_autofs_id(mountpoint: Union[str, os.PathLike]) -> str:
-    """Get the autofs id of a mountpoint path.
-
-    Args:
-        mountpoint: share mountpoint.
-    """
-    path = pathlib.Path(mountpoint).resolve()
-    return str(path).lstrip("/").replace("/", "-")
-
-
-def _mounts(fstype: str = "") -> Iterator[MountInfo]:
-    """Get an iterator of all mounts in the system that have the requested fstype.
-
-    Returns:
-        Iterator[MountInfo]: All the mounts with a valid fstype.
-    """
-    with pathlib.Path("/proc/mounts").open("rt") as mounts:
-        for mount in mounts:
-            # Lines in /proc/mounts follow the standard format
-            # <endpoint> <mountpoint> <fstype> <options> <freq> <passno>
-            m = MountInfo(*mount.split())
-            if fstype and not m.fstype.startswith(fstype):
-                continue
-
-            yield m
-
-
-def _get_endpoint_and_opts(info: FsInfo) -> tuple[str, [str]]:
+def _get_endpoint_and_opts(info: FilesystemInfo) -> tuple[str, [str]]:
     match info:
         case NfsInfo(hostname=hostname, port=port, path=path):
             try:
@@ -279,6 +224,6 @@ def _get_endpoint_and_opts(info: FsInfo) -> tuple[str, [str]]:
                 f"secret={secret}",
             ]
         case _:
-            raise Error(f"unsupported filesystem type `{info.fs_type()}`")
+            raise Error(f"unsupported filesystem type `{info.filesystem_type()}`")
 
     return endpoint, options

@@ -33,38 +33,35 @@ parts:
 
 subordinate: true
 
-peers:
-  storage-peers:
-    interface: storage_peers
-
 requires:
-  fs-share:
-    interface: fs_share
+  filesystem:
+    interface: filesystem_info
   juju-info:
     interface: juju-info
     scope: container
 
 config:
   options:
-    mountinfo:
+    mounts:
       default: "{}"
       type: string
       description: |
-        Information to mount the filesystem on the machine. This is specified as a JSON object string.
+        Information to mount filesystems on the machine. This is specified as a JSON object string.
         Example usage:
           ```bash
-          $ juju config slurmd mountpoints=<<EOF
-            {
-              "cephfs": {
-                "mountpoint": "/scratch",
-                "noexec": true
-              },
-              "nfs": {
-                "mountpoint": "/data",
-                "nosuid": true,
-                "nodev": true,
-                "read-only": true,
-              }
-            }
-          EOF
+          $ juju config filesystem-client \
+              mounts=<<EOF
+                {
+                  "cephfs": {
+                    "mountpoint": "/scratch",
+                    "noexec": true
+                  },
+                  "nfs": {
+                    "mountpoint": "/data",
+                    "nosuid": true,
+                    "nodev": true,
+                    "read-only": true,
+                  }
+                }
+              EOF
           ```
