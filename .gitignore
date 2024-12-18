@@ -8,3 +8,8 @@ __pycache__/
 .idea
 .vscode/
 requirements.txt
+
+# Ignore libs except the filesystem_client
+
+lib/charms/*
+!lib/charms/filesystem_client/

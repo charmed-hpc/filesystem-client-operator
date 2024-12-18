@@ -1,4 +1,5 @@
 uv := `which uv`
+charmcraft := `which charmcraft`
 
 project_dir := justfile_directory()
 
@@ -13,9 +14,17 @@ export PYTHONBREAKPOINT := "pdb.set_trace"
 
 uv_run := "uv run --frozen --extra dev"
 
-# Regenerate uv.lock
+# Regenerate uv.lock.
 lock:
     uv lock --no-cache
+
+# Fetch the required charm libraries.
+fetch-libs:
+    charmcraft fetch-libs
+
+# Create a development environment.
+env: lock fetch-libs
+    uv sync --extra dev
 
 # Upgrade uv.lock with the latest deps
 upgrade:
@@ -27,23 +36,22 @@ requirements: lock
 
 # Apply coding style standards to code
 fmt: lock
-    echo {{PYTHONPATH}}
     {{uv_run}} ruff format {{all}}
     {{uv_run}} ruff check --fix {{all}}
 
 # Check code against coding style standards
-lint: lock
+lint: lock fetch-libs
     {{uv_run}} codespell {{lib}}
     {{uv_run}} codespell {{project_dir}}
     {{uv_run}} ruff check {{all}}
     {{uv_run}} ruff format --check --diff {{all}}
 
 # Run static type checks
-typecheck *args: lock
+typecheck *args: lock fetch-libs
     {{uv_run}} pyright {{args}}
 
 # Run unit tests
-unit *args: lock
+unit *args: lock fetch-libs
     {{uv_run}} coverage run \
         --source={{src}} \
         --source={{lib}} \
@@ -56,7 +64,7 @@ unit *args: lock
     {{uv_run}} coverage report
 
 # Run integration tests
-integration *args: lock
+integration *args: lock fetch-libs
     {{uv_run}} pytest \
         -v \
         -s \
