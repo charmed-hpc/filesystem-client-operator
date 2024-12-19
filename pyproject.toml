@@ -3,9 +3,7 @@ name = "filesystem-client"
 version = "0.0"
 requires-python = "==3.12.*"
 dependencies = [
-    "ops ~= 2.8",
-    "jsonschema ~= 4.23.0",
-    "rpds_py ~= 0.22.3"
+    "ops ~= 2.8"
 ]
 
 [project.optional-dependencies]

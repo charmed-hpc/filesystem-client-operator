@@ -134,9 +134,7 @@ class MountsManager:
             for pkg in self._packages:
                 pkg.ensure(apt.PackageState.Present)
         except (apt.PackageError, apt.PackageNotFoundError) as e:
-            _logger.error(
-                f"failed to change the state of the required packages. reason:\n{e.message}"
-            )
+            _logger.error("Failed to change the state of the required packages.", exc_info=e)
             raise Error(e.message)
 
         try:
@@ -144,7 +142,7 @@ class MountsManager:
             self._autofs_file.touch(mode=0o600)
             self._master_file.write_text(f"/- {self._autofs_file}")
         except IOError as e:
-            _logger.error(f"failed to create the required autofs files. reason:\n{e}")
+            _logger.error("Failed to create the required autofs files.", exc_info=e)
             raise Error("failed to create the required autofs files")
 
     def supported(self) -> bool:
@@ -159,7 +157,7 @@ class MountsManager:
             else:
                 return True
         except subprocess.CalledProcessError:
-            _logger.warning("Could not detect execution in virtualized environment")
+            _logger.warning("Could not detect execution in virtualized environment.")
             return True
 
     @contextlib.contextmanager
@@ -195,9 +193,7 @@ class MountsManager:
             self._autofs_file.write_text(new_autofs)
             systemd.service_reload("autofs", restart_on_failure=True)
         except systemd.SystemdError as e:
-            _logger.error(f"failed to mount filesystems. reason:\n{e}")
-            if "Operation not permitted" in str(e) and not self.supported():
-                raise Error("mounting shares not supported on LXD containers")
+            _logger.error("Failed to mount filesystems.", exc_info=e)
             raise Error("failed to mount filesystems")
 
 

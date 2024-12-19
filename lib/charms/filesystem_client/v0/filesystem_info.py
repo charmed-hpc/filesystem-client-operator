@@ -583,16 +583,14 @@ class FilesystemRequires(_BaseInterface):
     def __init__(self, charm: CharmBase, relation_name: str) -> None:
         super().__init__(charm, relation_name)
         self.framework.observe(charm.on[relation_name].relation_changed, self._on_relation_changed)
-        self.framework.observe(
-            charm.on[relation_name].relation_departed, self._on_relation_departed
-        )
+        self.framework.observe(charm.on[relation_name].relation_broken, self._on_relation_broken)
 
     def _on_relation_changed(self, event: RelationChangedEvent) -> None:
         """Handle when the databag between client and server has been updated."""
         _logger.debug("Emitting `MountShare` event from `RelationChanged` hook")
         self.on.mount_filesystem.emit(event.relation, app=event.app, unit=event.unit)
 
-    def _on_relation_departed(self, event: RelationDepartedEvent) -> None:
+    def _on_relation_broken(self, event: RelationDepartedEvent) -> None:
         """Handle when server departs integration."""
         _logger.debug("Emitting `UmountShare` event from `RelationDeparted` hook")
         self.on.umount_filesystem.emit(event.relation, app=event.app, unit=event.unit)
