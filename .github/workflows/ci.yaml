@@ -19,6 +19,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   inclusive-naming-check:
     name: Inclusive naming check
@@ -45,6 +49,8 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.8"
+      - name: Install Charmcraft
+        run: sudo snap install charmcraft --classic --channel latest/stable
       - name: Run linters
         run: just lint
 
@@ -62,6 +68,8 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: 0.5.8
+      - name: Install Charmcraft
+        run: sudo snap install charmcraft --classic --channel latest/stable
       - name: Run unit tests
         run: just unit
 
@@ -79,8 +87,10 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: 0.5.8
+      - name: Install Charmcraft
+        run: sudo snap install charmcraft --classic --channel latest/stable
       - name: Run tests
-        run: just type
+        run: just typecheck
 
   integration-test:
     name: Integration tests (LXD)

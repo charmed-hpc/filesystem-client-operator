@@ -18,11 +18,11 @@ parts:
 
 peers:
   server-peers:
-    interface: server_peers 
+    interface: server_peers
 
 provides:
-  fs-share:
-    interface: fs_share
+  filesystem:
+    interface: filesystem_info
     limit: 1
 
 config:
