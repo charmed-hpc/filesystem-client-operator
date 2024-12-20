@@ -27,6 +27,7 @@ parts:
     charm-requirements: ["requirements.txt"]
     override-build: |
       just requirements
+      charmcraft fetch-libs
       craftctl default
 
 charm-libs:
